@@ -14,6 +14,7 @@ from .serializers import (
     ConsultationUploadSerializer,
 )
 from .tasks import process_consultation
+from .utils import create_zoom_meeting
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,16 @@ def schedule_consultation(request):
         )
 
     patient = get_object_or_404(Patient, id=patient_id, doctor=request.user)
+
+    # If no zoom_link provided, attempt to create a meeting via Zoom API
+    if not zoom_link:
+        try:
+            topic = f"Consultation: {patient.name} with Dr. {request.user.get_full_name() or request.user.username}"
+            created_link = create_zoom_meeting(topic, scheduled_at)
+            if created_link:
+                zoom_link = created_link
+        except Exception:
+            logger.exception('Error creating Zoom meeting')
 
     consultation = Consultation.objects.create(
         doctor=request.user,

@@ -101,6 +101,13 @@ CELERY_TASK_TRACK_STARTED = True
 # OpenAI
 OPENAI_API_KEY = config('OPENAI_API_KEY', default='')
 
+# Zoom configuration (JWT or OAuth server-to-server)
+ZOOM_API_KEY = config('ZOOM_API_KEY', default='')
+ZOOM_API_SECRET = config('ZOOM_API_SECRET', default='')
+ZOOM_OAUTH_CLIENT_ID = config('ZOOM_OAUTH_CLIENT_ID', default='')
+ZOOM_OAUTH_CLIENT_SECRET = config('ZOOM_OAUTH_CLIENT_SECRET', default='')
+ZOOM_OAUTH_ACCOUNT_ID = config('ZOOM_OAUTH_ACCOUNT_ID', default='')
+
 # File Storage
 USE_S3 = config('USE_S3', default=False, cast=bool)
 
