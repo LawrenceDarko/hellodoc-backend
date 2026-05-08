@@ -4,12 +4,14 @@ from .models import Consultation
 
 class ConsultationSerializer(serializers.ModelSerializer):
     patient_name = serializers.CharField(source='patient.name', read_only=True)
+    zoom_link = serializers.CharField(source='zoom_join_url', read_only=True)
 
     class Meta:
         model = Consultation
         fields = [
             'id', 'patient', 'patient_name', 'source', 'status',
-            'progress_step', 'zoom_link', 'scheduled_at',
+            'progress_step', 'zoom_meeting_id', 'zoom_join_url', 'zoom_link',
+            'zoom_start_url', 'zoom_password', 'recall_bot_id', 'scheduled_at',
             'audio_file_name', 'duration_minutes', 'notes',
             'error_message', 'created_at', 'updated_at'
         ]
@@ -23,7 +25,15 @@ class ConsultationStatusSerializer(serializers.ModelSerializer):
     """Lightweight serializer used by the frontend polling endpoint."""
     class Meta:
         model = Consultation
-        fields = ['id', 'status', 'progress_step', 'error_message']
+        fields = [
+            'id',
+            'status',
+            'progress_step',
+            'error_message',
+            'zoom_join_url',
+            'zoom_password',
+            'recall_bot_id',
+        ]
 
 
 class ConsultationUploadSerializer(serializers.Serializer):

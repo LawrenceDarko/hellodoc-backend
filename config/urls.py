@@ -2,9 +2,11 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
+from apps.consultations.views import recall_webhook
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('api/webhooks/recall/', recall_webhook, name='recall-webhook'),
     path('api/auth/', include('apps.users.urls')),
     path('api/patients/', include('apps.patients.urls')),
     path('api/consultations/', include('apps.consultations.urls')),

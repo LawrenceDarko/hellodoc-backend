@@ -108,6 +108,10 @@ ZOOM_OAUTH_CLIENT_ID = config('ZOOM_OAUTH_CLIENT_ID', default='')
 ZOOM_OAUTH_CLIENT_SECRET = config('ZOOM_OAUTH_CLIENT_SECRET', default='')
 ZOOM_OAUTH_ACCOUNT_ID = config('ZOOM_OAUTH_ACCOUNT_ID', default='')
 
+# Recall.ai configuration
+RECALL_AI_API_KEY = config('RECALL_AI_API_KEY', default='')
+RECALL_AI_WEBHOOK_SECRET = config('RECALL_AI_WEBHOOK_SECRET', default='')
+
 # File Storage
 USE_S3 = config('USE_S3', default=False, cast=bool)
 

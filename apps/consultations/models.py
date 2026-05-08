@@ -11,11 +11,14 @@ class Consultation(models.Model):
     SOURCE_CHOICES = [('zoom', 'Zoom Call'), ('upload', 'Upload')]
 
     STATUS_CHOICES = [
-        ('pending', 'Pending'),           # Just created, file saved, task queued
-        ('transcribing', 'Transcribing'), # Celery: Whisper is running
-        ('analyzing', 'Analyzing'),       # Celery: GPT-4 generating SOAP/diagnosis
-        ('completed', 'Completed'),       # All steps done, report is ready
-        ('failed', 'Failed'),             # Something went wrong in the pipeline
+        ('pending', 'Pending'),
+        ('scheduled', 'Scheduled'),       # Zoom meeting created, bot scheduled to join
+        ('in_progress', 'In Progress'),   # Recall.ai bot has joined the call and is recording
+        ('processing', 'Processing'),     # Call ended, downloading recording from Recall.ai
+        ('transcribing', 'Transcribing'),
+        ('analyzing', 'Analyzing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -35,8 +38,18 @@ class Consultation(models.Model):
     # For uploads
     audio_file = models.FileField(upload_to='consultations/audio/', null=True, blank=True)
     audio_file_name = models.CharField(max_length=255, blank=True)
-    # For Zoom
-    zoom_link = models.CharField(max_length=500, null=True, blank=True)
+    # Zoom meeting details
+    zoom_meeting_id = models.CharField(max_length=100, blank=True, default='')
+    zoom_join_url = models.CharField(max_length=1000, blank=True, default='')
+    zoom_start_url = models.CharField(max_length=1000, blank=True, default='')
+    zoom_password = models.CharField(max_length=50, blank=True, default='')
+    # Recall.ai bot — used to match incoming webhooks back to this consultation
+    recall_bot_id = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text="Recall.ai bot UUID. Set after bot is created. Used to match webhooks."
+    )
     scheduled_at = models.DateTimeField(null=True, blank=True)
     raw_transcript = models.TextField(
         blank=True,

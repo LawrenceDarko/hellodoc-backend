@@ -1,10 +1,14 @@
 import logging
+import json as json_module
 from rest_framework.decorators import api_view, permission_classes, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 from django.shortcuts import get_object_or_404
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+from django.http import HttpResponse
 
 from apps.patients.models import Patient
 from .models import Consultation
@@ -13,8 +17,8 @@ from .serializers import (
     ConsultationStatusSerializer,
     ConsultationUploadSerializer,
 )
-from .tasks import process_consultation
-from .utils import create_zoom_meeting
+from .tasks import process_consultation, process_zoom_consultation
+from .utils import create_zoom_meeting, create_recall_bot
 
 logger = logging.getLogger(__name__)
 
@@ -173,14 +177,26 @@ def schedule_consultation(request):
     """
     POST /api/consultations/schedule/
 
-    Body: { patient_id, scheduled_at, zoom_link, notes }
+    Body:
+    {
+        "patient_id": "uuid",
+        "scheduled_at": "2026-05-10T14:00:00Z",
+        "duration_minutes": 30,
+        "notes": "optional"
+    }
 
-    Creates a scheduled Zoom consultation. No Celery task is fired here —
-    the task will be triggered after the Zoom recording is uploaded.
+    Flow:
+    1. Validate required fields
+    2. Create Zoom meeting via Server-to-Server OAuth
+    3. Schedule Recall.ai bot to join 2 minutes before start time
+    4. Save all details to Consultation record
+    5. Return join details immediately
     """
+    from datetime import datetime, timedelta
+
     patient_id = request.data.get('patient_id')
     scheduled_at = request.data.get('scheduled_at')
-    zoom_link = request.data.get('zoom_link', '')
+    duration_minutes = int(request.data.get('duration_minutes', 30))
     notes = request.data.get('notes', '')
 
     if not patient_id or not scheduled_at:
@@ -191,25 +207,145 @@ def schedule_consultation(request):
 
     patient = get_object_or_404(Patient, id=patient_id, doctor=request.user)
 
-    # If no zoom_link provided, attempt to create a meeting via Zoom API
-    if not zoom_link:
-        try:
-            topic = f"Consultation: {patient.name} with Dr. {request.user.get_full_name() or request.user.username}"
-            created_link = create_zoom_meeting(topic, scheduled_at)
-            if created_link:
-                zoom_link = created_link
-        except Exception:
-            logger.exception('Error creating Zoom meeting')
+    try:
+        # Step 1: Create the Zoom meeting
+        meeting_topic = (
+            f"HelloDoc: Dr. {request.user.get_full_name() or request.user.username}"
+            f" & {patient.name}"
+        )
+        zoom_data = create_zoom_meeting(
+            topic=meeting_topic,
+            start_time_iso=scheduled_at,
+            duration_minutes=duration_minutes,
+        )
 
-    consultation = Consultation.objects.create(
-        doctor=request.user,
-        patient=patient,
-        source='zoom',
-        status='pending',
-        progress_step='Consultation scheduled',
-        zoom_link=zoom_link,
-        scheduled_at=scheduled_at,
-        notes=notes,
-    )
+        # Step 2: Schedule Recall.ai bot to join 2 minutes before start
+        scheduled_dt = datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
+        bot_join_dt = scheduled_dt - timedelta(minutes=2)
+        bot_join_iso = bot_join_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    return Response(ConsultationSerializer(consultation).data, status=status.HTTP_201_CREATED)
+        recall_data = create_recall_bot(
+            join_url=zoom_data['join_url'],
+            bot_name='HelloDoc AI',
+            join_at_iso=bot_join_iso,
+        )
+
+        # Step 3: Save consultation with all Zoom + Recall.ai details
+        consultation = Consultation.objects.create(
+            doctor=request.user,
+            patient=patient,
+            source='zoom',
+            status='scheduled',
+            progress_step='Meeting created. AI bot will join automatically 2 minutes before start.',
+            scheduled_at=scheduled_at,
+            duration_minutes=duration_minutes,
+            notes=notes,
+            zoom_meeting_id=zoom_data['meeting_id'],
+            zoom_join_url=zoom_data['join_url'],
+            zoom_start_url=zoom_data['start_url'],
+            zoom_password=zoom_data['password'],
+            recall_bot_id=recall_data['bot_id'],
+        )
+
+        logger.info(
+            f"Consultation {consultation.id} scheduled. "
+            f"Zoom meeting: {zoom_data['meeting_id']} | "
+            f"Recall bot: {recall_data['bot_id']} | "
+            f"Bot joins at: {bot_join_iso}"
+        )
+
+        return Response({
+            'id': str(consultation.id),
+            'consultation_id': str(consultation.id),
+            'status': consultation.status,
+            'scheduled_at': scheduled_at,
+            'zoom_join_url': zoom_data['join_url'],
+            'zoom_link': zoom_data['join_url'],  # Frontend compatibility
+            'zoom_password': zoom_data['password'],
+            'zoom_meeting_id': zoom_data['meeting_id'],
+            'recall_bot_id': recall_data['bot_id'],
+            'bot_joins_at': bot_join_iso,
+            'message': (
+                f"Consultation scheduled. The HelloDoc AI will join the "
+                f"Zoom call automatically at {bot_join_iso}."
+            ),
+        }, status=status.HTTP_201_CREATED)
+
+    except Exception as exc:
+        logger.error(f"Failed to schedule consultation: {exc}", exc_info=True)
+        return Response(
+            {'error': f'Failed to create meeting: {str(exc)}'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+# ─────────────────────────────────────────────────────────
+# RECALL.AI WEBHOOK — Handles bot events from Zoom calls
+# ─────────────────────────────────────────────────────────
+
+@csrf_exempt
+@require_POST
+def recall_webhook(request):
+    """
+    POST /api/webhooks/recall/
+
+    Recall.ai calls this when bot events occur during/after the Zoom call.
+    No JWT auth — protected by HMAC signature verification instead.
+    Must respond with 200 within 5 seconds. All heavy work goes to Celery.
+
+    Events handled:
+      bot.in_call_recording  → bot joined and is recording (update status)
+      bot.done               → call ended, recording ready (trigger pipeline)
+      bot.fatal_error        → bot failed to join (mark failed)
+    """
+    from .utils import verify_recall_signature
+
+    # Verify Recall.ai signature
+    signature = request.headers.get('X-Recall-Signature', '')
+    if not verify_recall_signature(request.body, signature):
+        logger.warning("Recall webhook rejected: invalid signature")
+        return HttpResponse(status=401)
+
+    try:
+        payload = json_module.loads(request.body)
+    except json_module.JSONDecodeError:
+        logger.warning("Recall webhook rejected: invalid JSON body")
+        return HttpResponse(status=400)
+
+    event = payload.get('event', '')
+    bot_id = payload.get('data', {}).get('bot', {}).get('id', '')
+
+    logger.info(f"Recall webhook received: event={event} bot_id={bot_id}")
+
+    if not bot_id:
+        return HttpResponse(status=200)
+
+    # Find the consultation linked to this bot
+    try:
+        consultation = Consultation.objects.get(recall_bot_id=bot_id)
+    except Consultation.DoesNotExist:
+        logger.warning(f"No consultation found for recall_bot_id: {bot_id}")
+        return HttpResponse(status=200)  # Return 200 so Recall does not retry endlessly
+
+    if event == 'bot.in_call_recording':
+        consultation.status = 'in_progress'
+        consultation.progress_step = 'AI is in the Zoom call and recording...'
+        consultation.save(update_fields=['status', 'progress_step', 'updated_at'])
+
+    elif event == 'bot.done':
+        consultation.status = 'processing'
+        consultation.progress_step = 'Call ended. Downloading recording...'
+        consultation.save(update_fields=['status', 'progress_step', 'updated_at'])
+        # Hand off to Celery — downloads recording then runs existing pipeline
+        process_zoom_consultation.delay(str(consultation.id), bot_id)
+
+    elif event == 'bot.fatal_error':
+        error_msg = payload.get('data', {}).get('message', 'Recall.ai bot fatal error.')
+        consultation.status = 'failed'
+        consultation.error_message = error_msg
+        consultation.progress_step = 'AI bot failed to join the call.'
+        consultation.save(update_fields=['status', 'error_message', 'progress_step', 'updated_at'])
+        logger.error(f"Recall bot fatal error for consultation {consultation.id}: {error_msg}")
+
+    # Always return 200 immediately — Recall.ai retries on non-200
+    return HttpResponse(status=200)

@@ -1,6 +1,7 @@
 import json
 import logging
 from io import BytesIO
+from xml.sax.saxutils import escape
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -57,7 +58,7 @@ def consultation_report(request, consultation_id):
 @permission_classes([IsAuthenticated])
 def export_report(request, consultation_id):
     """
-    GET /api/consultations/:id/export/?format=pdf|json
+        GET /api/consultations/:id/export/?export_format=pdf|json
 
     Exports the full report as either:
       - PDF: generated with ReportLab, returned as file download
@@ -74,7 +75,7 @@ def export_report(request, consultation_id):
         )
 
     report = get_object_or_404(ConsultationReport, consultation=consultation)
-    export_format = request.query_params.get('format', 'json')
+    export_format = request.query_params.get('export_format') or request.query_params.get('format', 'json')
 
     if export_format == 'json':
         serializer = ConsultationReportSerializer(report)
@@ -86,7 +87,7 @@ def export_report(request, consultation_id):
         filename = f"hellodoc_report_{consultation.patient.name.replace(' ', '_')}_{consultation.created_at.strftime('%Y%m%d')}.pdf"
         return FileResponse(buffer, as_attachment=True, filename=filename, content_type='application/pdf')
 
-    return Response({'error': 'Invalid format. Use ?format=pdf or ?format=json'}, status=400)
+    return Response({'error': 'Invalid format. Use ?export_format=pdf or ?export_format=json'}, status=400)
 
 
 def generate_pdf(report):
@@ -105,9 +106,13 @@ def generate_pdf(report):
     doc = SimpleDocTemplate(buffer, pagesize=A4,
                             topMargin=2*cm, bottomMargin=2*cm,
                             leftMargin=2.5*cm, rightMargin=2.5*cm)
+    content_width = doc.width
 
     styles = getSampleStyleSheet()
     story = []
+
+    def safe_text(value):
+        return escape('' if value is None else str(value))
 
     # Title
     title_style = ParagraphStyle('Title', parent=styles['Title'],
@@ -120,12 +125,21 @@ def generate_pdf(report):
     # Patient info
     patient = report.consultation.patient
     info_style = ParagraphStyle('Info', parent=styles['Normal'], fontSize=10, textColor=colors.grey)
-    story.append(Paragraph(f"Patient: {patient.name} | Date: {report.consultation.created_at.strftime('%B %d, %Y')} | Source: {report.consultation.get_source_display()}", info_style))
+    story.append(Paragraph(
+        f"Patient: {safe_text(patient.name)} | Date: {safe_text(report.consultation.created_at.strftime('%B %d, %Y'))} | Source: {safe_text(report.consultation.get_source_display())}",
+        info_style,
+    ))
     story.append(Spacer(1, 0.5*cm))
 
     heading_style = ParagraphStyle('Heading', parent=styles['Heading2'],
                                     fontSize=13, textColor=colors.HexColor('#1E6FD9'), spaceAfter=4)
     body_style = ParagraphStyle('Body', parent=styles['Normal'], fontSize=10, spaceAfter=4, leading=16)
+    table_text_style = ParagraphStyle('TableText', parent=styles['Normal'], fontSize=8.5, leading=10)
+    table_header_style = ParagraphStyle('TableHeader', parent=styles['Normal'], fontSize=8.5, leading=10, textColor=colors.white)
+
+    def cell(text, header=False):
+        style = table_header_style if header else table_text_style
+        return Paragraph(safe_text(text), style)
 
     # SOAP Note
     story.append(Paragraph("SOAP Note", heading_style))
@@ -135,48 +149,53 @@ def generate_pdf(report):
         ('Assessment', report.soap_assessment),
         ('Plan', report.soap_plan),
     ]:
-        story.append(Paragraph(f"<b>{label}:</b> {text}", body_style))
+        story.append(Paragraph(f"<b>{safe_text(label)}:</b> {safe_text(text)}", body_style))
     story.append(Spacer(1, 0.4*cm))
 
     # Differential Diagnosis Table
     story.append(Paragraph("Differential Diagnosis", heading_style))
-    diag_data = [['Condition', 'Likelihood', 'ICD-10', 'Reasoning']]
+    diag_data = [[
+        cell('Condition', header=True),
+        cell('Likelihood', header=True),
+        cell('ICD-10', header=True),
+        cell('Reasoning', header=True),
+    ]]
     for item in report.diagnosis_items.all():
         diag_data.append([
-            item.condition,
-            f"{item.likelihood:.0f}%",
-            item.icd_code,
-            item.reasoning[:80] + '...' if len(item.reasoning) > 80 else item.reasoning
+            cell(item.condition),
+            cell(f"{item.likelihood:.0f}%"),
+            cell(item.icd_code),
+            cell(item.reasoning[:120] + '...' if len(item.reasoning) > 120 else item.reasoning)
         ])
-    diag_table = Table(diag_data, colWidths=[5*cm, 2.5*cm, 2.5*cm, 6.5*cm])
+    diag_table = Table(diag_data, colWidths=[0.24 * content_width, 0.12 * content_width, 0.12 * content_width, 0.52 * content_width], repeatRows=1)
     diag_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1E6FD9')),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
         ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
         ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F8FAFC')]),
         ('TOPPADDING', (0, 0), (-1, -1), 5),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
     ]))
     story.append(diag_table)
     story.append(Spacer(1, 0.4*cm))
 
     # Scan Recommendations
     story.append(Paragraph("Recommended Investigations", heading_style))
-    scan_data = [['Investigation', 'Reason', 'Priority']]
+    scan_data = [[cell('Investigation', header=True), cell('Reason', header=True), cell('Priority', header=True)]]
     for scan in report.scan_recommendations.all():
-        scan_data.append([scan.scan_name, scan.reason, scan.priority.capitalize()])
-    scan_table = Table(scan_data, colWidths=[4.5*cm, 9*cm, 3*cm])
+        scan_data.append([cell(scan.scan_name), cell(scan.reason), cell(scan.priority.capitalize())])
+    scan_table = Table(scan_data, colWidths=[0.38 * content_width, 0.48 * content_width, 0.14 * content_width], repeatRows=1)
     scan_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1E6FD9')),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
         ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
         ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
         ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F8FAFC')]),
         ('TOPPADDING', (0, 0), (-1, -1), 5),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
     ]))
     story.append(scan_table)
     story.append(Spacer(1, 0.5*cm))
@@ -187,7 +206,7 @@ def generate_pdf(report):
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
     story.append(Spacer(1, 0.2*cm))
     story.append(Paragraph(
-        "AI-generated report. Always apply clinical judgment. Not a substitute for professional medical evaluation. HelloDoc — HIPAA Compliant.",
+        safe_text("AI-generated report. Always apply clinical judgment. Not a substitute for professional medical evaluation. HelloDoc - HIPAA Compliant."),
         disclaimer_style
     ))
 
