@@ -3,8 +3,10 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 from apps.consultations.views import recall_webhook
+from apps.core.views import health
 
 urlpatterns = [
+    path('health/', health, name='health'),
     path('admin/', admin.site.urls),
     path('api/webhooks/recall/', recall_webhook, name='recall-webhook'),
     path('api/auth/', include('apps.users.urls')),

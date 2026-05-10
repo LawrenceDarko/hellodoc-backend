@@ -1,12 +1,33 @@
 from pathlib import Path
+from datetime import timedelta
+from django.core.exceptions import ImproperlyConfigured
 from decouple import config, Csv
 import dj_database_url
+
+try:
+    import sentry_sdk
+except ModuleNotFoundError:
+    sentry_sdk = None
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = config('SECRET_KEY')
 DEBUG = config('DEBUG', default=False, cast=bool)
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', cast=Csv())
+ALLOWED_HOSTS = config('ALLOWED_HOSTS', cast=Csv()) + ['testserver']
+ENVIRONMENT = config('ENVIRONMENT', default='development')
+
+if SECRET_KEY.startswith('your-') or len(SECRET_KEY) < 50:
+    raise ImproperlyConfigured('SECRET_KEY is insecure')
+
+if DEBUG and not config('ALLOW_DEBUG', cast=bool, default=False):
+    raise ImproperlyConfigured('DEBUG must be False in production')
+
+if sentry_sdk:
+    sentry_sdk.init(
+        dsn=config('SENTRY_DSN', default=''),
+        traces_sample_rate=config('SENTRY_TRACES_RATE', cast=float, default=0.1),
+        environment=ENVIRONMENT,
+    )
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -18,10 +39,12 @@ INSTALLED_APPS = [
     # Third party
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     'django_celery_results',
     'storages',
     # HelloDoc apps
+    'apps.core',
     'apps.users',
     'apps.patients',
     'apps.consultations',
@@ -65,6 +88,9 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DATABASES = {
     'default': dj_database_url.config(default=config('DATABASE_URL'))
 }
+DATABASES['default']['CONN_MAX_AGE'] = 60
+DATABASES['default']['CONN_HEALTH_CHECKS'] = True
+# Production deployments should use PgBouncer for PostgreSQL connection pooling.
 
 # DRF + JWT
 REST_FRAMEWORK = {
@@ -74,18 +100,34 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '20/min',
+        'user': '100/min',
+        'openai': '5/min',
+    },
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 25,
 }
 
-from datetime import timedelta
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'ROTATE_REFRESH_TOKENS': True,
     'BLACKLIST_AFTER_ROTATION': True,
+    'AUTH_COOKIE_HTTP_ONLY': True,
+    'AUTH_COOKIE_SECURE': not DEBUG,
+    'AUTH_COOKIE_SAMESITE': 'Strict',
+    'SIGNING_KEY': config('JWT_SECRET', default=SECRET_KEY),
 }
 
 # CORS
-CORS_ALLOWED_ORIGINS = [config('FRONTEND_URL', default='http://localhost:3000')]
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in config('FRONTEND_URL', default='').split(',') if origin.strip()]
+if not DEBUG and CORS_ALLOWED_ORIGINS == ['*']:
+    raise ImproperlyConfigured('CORS_ALLOWED_ORIGINS cannot be wildcard in production')
 CORS_ALLOW_CREDENTIALS = True
 
 # Celery
@@ -97,13 +139,17 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
 CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_DEFAULT_QUEUE = 'default'
+CELERY_TASK_ROUTES = {
+    'apps.consultations.tasks.process_consultation': {'queue': 'ai'},
+    'apps.consultations.tasks.process_zoom_consultation': {'queue': 'ai'},
+}
 
 # OpenAI
 OPENAI_API_KEY = config('OPENAI_API_KEY', default='')
+TRANSCRIPTION_DAILY_MINUTE_CAP = config('TRANSCRIPTION_DAILY_MINUTE_CAP', default=120, cast=int)
 
-# Zoom configuration (JWT or OAuth server-to-server)
-ZOOM_API_KEY = config('ZOOM_API_KEY', default='')
-ZOOM_API_SECRET = config('ZOOM_API_SECRET', default='')
+# Zoom configuration (server-to-server OAuth)
 ZOOM_OAUTH_CLIENT_ID = config('ZOOM_OAUTH_CLIENT_ID', default='')
 ZOOM_OAUTH_CLIENT_SECRET = config('ZOOM_OAUTH_CLIENT_SECRET', default='')
 ZOOM_OAUTH_ACCOUNT_ID = config('ZOOM_OAUTH_ACCOUNT_ID', default='')
@@ -111,6 +157,7 @@ ZOOM_OAUTH_ACCOUNT_ID = config('ZOOM_OAUTH_ACCOUNT_ID', default='')
 # Recall.ai configuration
 RECALL_AI_API_KEY = config('RECALL_AI_API_KEY', default='')
 RECALL_AI_WEBHOOK_SECRET = config('RECALL_AI_WEBHOOK_SECRET', default='')
+RECALL_SVIX_WEBHOOK_SECRET = config('RECALL_SVIX_WEBHOOK_SECRET', default='')
 
 # File Storage
 USE_S3 = config('USE_S3', default=False, cast=bool)

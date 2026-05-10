@@ -3,10 +3,22 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
 from django.contrib.auth import get_user_model
 from .serializers import RegisterSerializer, UserSerializer
 
 User = get_user_model()
+
+
+class LoginView(TokenObtainPairView):
+    """Issue JWTs and include the authenticated user in the response."""
+
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+        if response.status_code == status.HTTP_200_OK:
+            user = User.objects.get(email=request.data.get('email'))
+            response.data['user'] = UserSerializer(user).data
+        return response
 
 
 @api_view(['POST'])

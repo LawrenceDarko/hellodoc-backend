@@ -1,7 +1,8 @@
 from django.db import models
+from apps.core.models import SoftDeleteModel
 
 
-class ConsultationReport(models.Model):
+class ConsultationReport(SoftDeleteModel):
     consultation = models.OneToOneField(
         'consultations.Consultation',
         on_delete=models.CASCADE,
@@ -26,7 +27,7 @@ class ConsultationReport(models.Model):
         return f"Report — {self.consultation}"
 
 
-class DiagnosisItem(models.Model):
+class DiagnosisItem(SoftDeleteModel):
     """
     Individual condition in the differential diagnosis.
     Ranked by likelihood descending.
@@ -48,7 +49,7 @@ class DiagnosisItem(models.Model):
         return f"{self.condition} ({self.likelihood}%)"
 
 
-class ScanRecommendation(models.Model):
+class ScanRecommendation(SoftDeleteModel):
     """
     Imaging or lab test recommended based on the diagnosis.
     """

@@ -6,7 +6,9 @@ import subprocess
 
 from celery import shared_task
 from django.conf import settings
+from django.utils import timezone
 from openai import OpenAI
+from redis import Redis
 
 logger = logging.getLogger(__name__)
 
@@ -14,84 +16,76 @@ logger = logging.getLogger(__name__)
 WHISPER_MAX_SIZE_BYTES = 25 * 1024 * 1024  # 25MB
 WHISPER_SAFE_SIZE_BYTES = 20 * 1024 * 1024  # Leave headroom for multipart overhead
 WHISPER_CHUNK_SECONDS = 600  # 10 minutes per segment when chunking long recordings
+WHISPER_MAX_DURATION_SECONDS = 60 * 60
 
 
 def get_openai_client():
     return OpenAI(api_key=settings.OPENAI_API_KEY)
 
 
-def update_status(consultation, status, step=''):
+def update_status(consultation, status, step='', progress_percent=None):
     """Helper to update consultation status and save."""
     consultation.status = status
     consultation.progress_step = step
-    consultation.save(update_fields=['status', 'progress_step', 'updated_at'])
+    update_fields = ['status', 'progress_step', 'updated_at']
+    if progress_percent is not None:
+        consultation.progress_percent = max(0, min(100, int(progress_percent)))
+        update_fields.append('progress_percent')
+    consultation.save(update_fields=update_fields)
 
 
-# ─────────────────────────────────────────────────────────
-# ZOOM RECORDING DOWNLOAD & CONVERGENCE TASK
-# ─────────────────────────────────────────────────────────
-
-@shared_task(bind=True, max_retries=3, default_retry_delay=60)
-def process_zoom_consultation(self, consultation_id, bot_id):
-    """
-    Triggered by the Recall.ai webhook when a Zoom call ends and
-    the recording is ready to download.
-
-    Steps:
-      1. Fetch recording download URL from Recall.ai
-      2. Download audio bytes
-      3. Save audio to consultation.audio_file (same S3/local storage as uploads)
-      4. Call process_consultation.delay() — runs the existing pipeline:
-         Whisper → doctor's note → SOAP → diagnosis → scans
-
-    By converging here, Zoom and Upload consultations share exactly the
-    same processing pipeline from this point forward.
-    """
-    import io
-    from django.core.files.base import ContentFile
-    from .models import Consultation
-    from .utils import get_recall_bot_recording_url, download_audio_bytes
-
-    try:
-        consultation = Consultation.objects.get(id=consultation_id)
-    except Consultation.DoesNotExist:
-        logger.error(f"Consultation {consultation_id} not found for Zoom processing.")
+def log_openai_usage(response, label):
+    usage = getattr(response, 'usage', None)
+    if not usage:
+        logger.info("OpenAI usage unavailable for %s", label)
         return
 
-    try:
-        update_status(consultation, 'processing', 'Retrieving recording from Recall.ai...')
+    logger.info(
+        "OpenAI usage for %s: prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+        label,
+        getattr(usage, 'prompt_tokens', None),
+        getattr(usage, 'completion_tokens', None),
+        getattr(usage, 'total_tokens', None),
+    )
 
-        # Step 1: Get the audio download URL from Recall.ai
-        audio_url = get_recall_bot_recording_url(bot_id)
 
-        # Step 2: Download the audio
-        update_status(consultation, 'processing', 'Downloading call recording...')
-        audio_bytes = download_audio_bytes(audio_url)
+def get_audio_duration_seconds(audio_path):
+    cmd = [
+        'ffprobe',
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        audio_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise Exception(f"ffprobe duration check failed: {result.stderr}")
+    return float(result.stdout.strip())
 
-        # Step 3: Save to storage — same field and path as file uploads
-        filename = f"zoom_{consultation_id}.mp4"
-        audio_file = ContentFile(audio_bytes, name=filename)
-        consultation.audio_file.save(filename, audio_file, save=False)
-        consultation.audio_file_name = filename
-        consultation.save(update_fields=['audio_file', 'audio_file_name', 'updated_at'])
 
-        logger.info(
-            f"Zoom recording saved for consultation {consultation_id}. "
-            f"{len(audio_bytes) / (1024*1024):.2f}MB. Handing off to pipeline."
+def enforce_daily_transcription_limit(consultation, duration_seconds):
+    duration_minutes = duration_seconds / 60
+    cap = getattr(settings, 'TRANSCRIPTION_DAILY_MINUTE_CAP', 120)
+    redis_client = Redis.from_url(settings.CELERY_BROKER_URL)
+    today = timezone.now().date().isoformat()
+    key = f"transcription_minutes:{consultation.doctor_id}:{today}"
+    total = redis_client.incrbyfloat(key, duration_minutes)
+    redis_client.expire(key, 60 * 60 * 48)
+
+    if total > cap:
+        redis_client.incrbyfloat(key, -duration_minutes)
+        raise Exception(
+            f"Daily transcription limit exceeded. Requested {duration_minutes:.1f} minutes; "
+            f"cap is {cap} minutes/day."
         )
 
-        # Step 4: Fire the existing pipeline — identical to upload flow from here
-        process_consultation.delay(consultation_id)
-
-    except Exception as exc:
-        logger.error(
-            f"Failed to process Zoom recording for consultation {consultation_id}: {exc}",
-            exc_info=True,
-        )
-        consultation.status = 'failed'
-        consultation.error_message = f"Failed to retrieve Zoom recording: {str(exc)}"
-        consultation.save(update_fields=['status', 'error_message', 'updated_at'])
-        raise self.retry(exc=exc)
+    logger.info(
+        "Transcription minutes for user %s on %s: %.1f/%.1f",
+        consultation.doctor_id,
+        today,
+        total,
+        cap,
+    )
 
 
 # ─────────────────────────────────────────────────────────
@@ -125,14 +119,14 @@ def process_consultation(self, consultation_id):
         doctors_note = step_generate_doctors_note(consultation, raw_transcript)
 
         # STEP 3: Generate SOAP note from doctor's note
-        soap = step_generate_soap(consultation, doctors_note)
+        step_generate_soap(consultation, doctors_note)
 
         # STEP 4: Generate differential diagnosis from doctor's note
         diagnosis_payload = step_generate_diagnosis(consultation, doctors_note)
 
         # STEP 5: Generate scan recommendations unless the note lacks enough detail
         if diagnosis_payload.get('insufficient_information'):
-            update_status(consultation, 'completed', 'Report ready')
+            update_status(consultation, 'completed', 'Report ready', 100)
             logger.info(
                 f"Consultation {consultation_id} completed without diagnosis/scans: {diagnosis_payload.get('insufficient_reason', '')}"
             )
@@ -141,7 +135,7 @@ def process_consultation(self, consultation_id):
         step_generate_scans(consultation, diagnosis_payload.get('diagnoses', []))
 
         # All done
-        update_status(consultation, 'completed', 'Report ready')
+        update_status(consultation, 'completed', 'Report ready', 100)
         logger.info(f"Consultation {consultation_id} fully processed.")
 
     except Exception as exc:
@@ -244,6 +238,7 @@ def transcribe_audio_path(client, audio_path):
             language='en',
         )
 
+    log_openai_usage(transcript_response, 'whisper transcription')
     return transcript_response.text
 
 
@@ -320,13 +315,42 @@ def parse_json_object_payload(content, label):
     raise ValueError(f"{label} response was not a JSON object. Received: {str(content)[:500]}")
 
 
+def first_present(mapping, keys):
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ''):
+            return value
+    return None
+
+
+def normalize_scan_recommendation(scan):
+    scan_name = first_present(
+        scan,
+        ('scan_name', 'scan', 'scanName', 'test_name', 'test', 'investigation', 'name'),
+    )
+    reason = first_present(scan, ('reason', 'rationale', 'clinical_reasoning', 'clinical_reason'))
+    priority = str(first_present(scan, ('priority', 'urgency'),) or 'routine').strip().lower()
+
+    if priority not in {'urgent', 'routine'}:
+        priority = 'urgent' if priority in {'high', 'stat', 'immediate'} else 'routine'
+
+    if not scan_name or not reason:
+        raise ValueError(f"Scan recommendation is missing required fields: {scan}")
+
+    return {
+        'scan_name': str(scan_name).strip(),
+        'reason': str(reason).strip(),
+        'priority': priority,
+    }
+
+
 def step_transcribe(consultation):
     """
     Downloads the audio file and sends it to OpenAI Whisper.
     Automatically compresses if file exceeds 25MB limit.
     Returns the raw transcript text string.
     """
-    update_status(consultation, 'transcribing', 'Transcribing audio with Whisper...')
+    update_status(consultation, 'transcribing', 'Transcribing audio with Whisper...', 10)
     client = get_openai_client()
 
     # Download the file from storage (S3/Supabase or local)
@@ -347,6 +371,11 @@ def step_transcribe(consultation):
     chunk_paths = []
     
     try:
+        duration_seconds = get_audio_duration_seconds(tmp_path)
+        if duration_seconds > WHISPER_MAX_DURATION_SECONDS:
+            raise Exception("Audio files longer than 60 minutes are not accepted for transcription.")
+        enforce_daily_transcription_limit(consultation, duration_seconds)
+
         # Check file size and compress if necessary.
         # We use a smaller safe threshold so multipart upload overhead does not
         # push the request over OpenAI's hard 25MB limit.
@@ -363,6 +392,13 @@ def step_transcribe(consultation):
             transcript_parts = []
 
             for idx, chunk_path in enumerate(chunk_paths, 1):
+                chunk_progress = 15 + int((idx - 1) / max(len(chunk_paths), 1) * 15)
+                update_status(
+                    consultation,
+                    'transcribing',
+                    f'Transcribing audio chunk {idx} of {len(chunk_paths)}...',
+                    chunk_progress,
+                )
                 chunk_size = os.path.getsize(chunk_path)
                 logger.info(
                     f"Transcribing chunk {idx}/{len(chunk_paths)} ({chunk_size / (1024 * 1024):.2f}MB)"
@@ -371,7 +407,9 @@ def step_transcribe(consultation):
 
             raw_transcript = '\n'.join(part.strip() for part in transcript_parts if part.strip())
             consultation.raw_transcript = raw_transcript
-            consultation.save(update_fields=['raw_transcript', 'updated_at'])
+            consultation.progress_percent = 35
+            consultation.progress_step = 'Transcription complete. Preparing clinical note...'
+            consultation.save(update_fields=['raw_transcript', 'progress_percent', 'progress_step', 'updated_at'])
 
             logger.info(
                 f"Transcription complete from {len(chunk_paths)} chunk(s). Length: {len(raw_transcript)} chars"
@@ -381,7 +419,9 @@ def step_transcribe(consultation):
             raw_transcript = transcribe_audio_path(client, tmp_path)
 
         consultation.raw_transcript = raw_transcript
-        consultation.save(update_fields=['raw_transcript', 'updated_at'])
+        consultation.progress_percent = 35
+        consultation.progress_step = 'Transcription complete. Preparing clinical note...'
+        consultation.save(update_fields=['raw_transcript', 'progress_percent', 'progress_step', 'updated_at'])
         
         if compression_performed:
             logger.info(f"Transcription complete (after compression). Length: {len(raw_transcript)} chars")
@@ -436,7 +476,7 @@ def step_generate_doctors_note(consultation, raw_transcript):
     to generate a cohesive doctor's note.
     Saves the note to ConsultationReport and returns it.
     """
-    update_status(consultation, 'analyzing', 'Generating doctor\'s note...')
+    update_status(consultation, 'analyzing', 'Writing doctor\'s note from transcript...', 40)
     client = get_openai_client()
     
     # Split transcript into manageable chunks
@@ -447,6 +487,13 @@ def step_generate_doctors_note(consultation, raw_transcript):
     
     # Process each chunk
     for idx, chunk in enumerate(chunks, 1):
+        chunk_progress = 40 + int((idx - 1) / max(len(chunks), 1) * 15)
+        update_status(
+            consultation,
+            'analyzing',
+            f'Writing doctor\'s note from transcript chunk {idx} of {len(chunks)}...',
+            chunk_progress,
+        )
         prompt = f"""
 You are a clinical documentation specialist. Below is a portion of a doctor-patient consultation transcript.
 Generate a concise, professional clinical narrative for this segment.
@@ -469,6 +516,7 @@ Return only the clinical note text, no other commentary.
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.2,
         )
+        log_openai_usage(response, f"doctor note chunk {idx}")
         
         chunk_note = response.choices[0].message.content
         chunk_notes.append(chunk_note)
@@ -493,11 +541,13 @@ CLINICAL SEGMENTS:
 Return only the final synthesized doctor's note.
 """
     
+    update_status(consultation, 'analyzing', 'Synthesizing doctor\'s note...', 58)
     synthesis_response = client.chat.completions.create(
         model='gpt-4o',
         messages=[{'role': 'user', 'content': synthesis_prompt}],
         temperature=0.2,
     )
+    log_openai_usage(synthesis_response, "doctor note synthesis")
     
     doctors_note = synthesis_response.choices[0].message.content
     
@@ -506,6 +556,7 @@ Return only the final synthesized doctor's note.
     report, _ = ConsultationReport.objects.get_or_create(consultation=consultation)
     report.doctors_note = doctors_note
     report.save(update_fields=['doctors_note'])
+    update_status(consultation, 'analyzing', 'Doctor\'s note complete. Building SOAP note...', 65)
     
     logger.info(f"Doctor's note generated and saved. Length: {len(doctors_note)} chars")
     return doctors_note
@@ -521,7 +572,7 @@ def step_generate_soap(consultation, doctors_note):
     Saves to ConsultationReport.
     Returns the SOAP dict.
     """
-    update_status(consultation, 'analyzing', 'Generating SOAP note...')
+    update_status(consultation, 'analyzing', 'Generating SOAP note...', 70)
     client = get_openai_client()
 
     prompt = f"""
@@ -545,6 +596,7 @@ DOCTOR'S NOTE:
         temperature=0.2,
         response_format={'type': 'json_object'},
     )
+    log_openai_usage(response, "SOAP generation")
 
     soap = parse_json_object_payload(response.choices[0].message.content, 'SOAP')
 
@@ -556,6 +608,7 @@ DOCTOR'S NOTE:
     report.soap_assessment = soap.get('assessment', '')
     report.soap_plan = soap.get('plan', '')
     report.save()
+    update_status(consultation, 'analyzing', 'SOAP note complete. Generating diagnosis...', 78)
 
     logger.info("SOAP note generated and saved.")
     return soap
@@ -571,7 +624,7 @@ def step_generate_diagnosis(consultation, doctors_note):
     Saves DiagnosisItem records to the ConsultationReport.
     Returns the diagnosis list.
     """
-    update_status(consultation, 'analyzing', 'Generating differential diagnosis...')
+    update_status(consultation, 'analyzing', 'Generating differential diagnosis...', 82)
     client = get_openai_client()
 
     prompt = f"""
@@ -617,6 +670,7 @@ DOCTOR'S NOTE:
         temperature=0.1,
         response_format={'type': 'json_object'},
     )
+    log_openai_usage(response, "diagnosis generation")
 
     diagnosis_payload = parse_json_object_payload(response.choices[0].message.content, 'Diagnosis')
     diagnosis_list = parse_json_array_payload(
@@ -653,6 +707,7 @@ DOCTOR'S NOTE:
         )
     else:
         logger.info(f"Diagnosis generated. {len(diagnosis_list)} conditions saved.")
+    update_status(consultation, 'analyzing', 'Diagnosis complete. Recommending investigations...', 90)
 
     return {
         'diagnoses': diagnosis_list,
@@ -671,7 +726,7 @@ def step_generate_scans(consultation, diagnosis_list):
     Saves ScanRecommendation records.
     No longer needs transcript as input.
     """
-    update_status(consultation, 'analyzing', 'Generating scan recommendations...')
+    update_status(consultation, 'analyzing', 'Generating scan recommendations...', 92)
     client = get_openai_client()
 
     if not diagnosis_list:
@@ -717,12 +772,14 @@ Return ONLY a JSON object in exactly this format, no other text:
         temperature=0.1,
         response_format={'type': 'json_object'},
     )
+    log_openai_usage(response, "scan recommendation generation")
 
     scans_list = parse_json_array_payload(
         response.choices[0].message.content,
         'Scan recommendations',
         item_keys={'scan_name', 'reason', 'priority'}
     )
+    scans_list = [normalize_scan_recommendation(scan) for scan in scans_list]
 
     from apps.diagnosis.models import ConsultationReport, ScanRecommendation
     report = ConsultationReport.objects.get(consultation=consultation)
@@ -739,13 +796,14 @@ Return ONLY a JSON object in exactly this format, no other text:
     ])
 
     logger.info(f"Scan recommendations generated. {len(scans_list)} saved.")
+    update_status(consultation, 'analyzing', 'Finalising report...', 98)
 
 
 # ─────────────────────────────────────────────────────────
 # ZOOM + RECALL.AI PIPELINE — Downloads recording then processes
 # ─────────────────────────────────────────────────────────
 
-@shared_task(bind=True, max_retries=2, default_retry_delay=60)
+@shared_task(bind=True, max_retries=6, default_retry_delay=60)
 def process_zoom_consultation(self, consultation_id, bot_id):
     """
     Triggered by Recall.ai webhook after bot.done event.
@@ -770,18 +828,18 @@ def process_zoom_consultation(self, consultation_id, bot_id):
         return
 
     try:
-        update_status(consultation, 'processing', 'Fetching recording download URL...')
+        update_status(consultation, 'processing', 'Fetching recording download URL...', 6)
 
         # Step 1: Get the recording download URL from Recall.ai
         download_url = get_recall_bot_recording_url(bot_id)
         logger.info(f"Recording URL for bot {bot_id}: {download_url}")
 
         # Step 2: Download audio bytes
-        update_status(consultation, 'processing', 'Downloading recording from Recall.ai...')
+        update_status(consultation, 'processing', 'Downloading recording from Recall.ai...', 8)
         audio_bytes = download_audio_bytes(download_url)
 
         # Step 3: Save to Django's file storage with a unique name
-        filename = f"zoom_{consultation_id}_{bot_id}.mp3"
+        filename = f"zoom_{consultation_id}_{bot_id}.mp4"
         consultation.audio_file.save(filename, ContentFile(audio_bytes), save=True)
         consultation.audio_file_name = filename
         consultation.save(update_fields=['audio_file', 'audio_file_name', 'updated_at'])
@@ -789,14 +847,22 @@ def process_zoom_consultation(self, consultation_id, bot_id):
         logger.info(f"Recording saved for consultation {consultation_id}: {filename}")
 
         # Step 4: Feed to the main transcription + analysis pipeline
-        update_status(consultation, 'transcribing', 'Recording saved. Starting transcription...')
+        update_status(consultation, 'transcribing', 'Recording saved. Starting transcription...', 10)
         process_consultation(consultation_id)
 
     except Exception as exc:
+        if self.request.retries < self.max_retries:
+            logger.warning(
+                f"Zoom recording not ready for {consultation_id}; retrying "
+                f"({self.request.retries + 1}/{self.max_retries}): {exc}"
+            )
+            consultation.progress_step = 'Waiting for Recall.ai recording media to finish processing...'
+            consultation.progress_percent = 8
+            consultation.save(update_fields=['progress_step', 'progress_percent', 'updated_at'])
+            raise self.retry(exc=exc)
+
         logger.error(f"Failed to download/process Zoom recording for {consultation_id}: {exc}", exc_info=True)
         consultation.status = 'failed'
         consultation.error_message = f"Failed to download Zoom recording: {str(exc)}"
         consultation.progress_step = 'Failed to retrieve recording from Recall.ai'
         consultation.save(update_fields=['status', 'error_message', 'progress_step', 'updated_at'])
-        # Retry up to max_retries
-        raise self.retry(exc=exc)

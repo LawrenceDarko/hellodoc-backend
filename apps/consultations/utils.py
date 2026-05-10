@@ -21,9 +21,9 @@ def get_zoom_access_token():
     Reads ZOOM_OAUTH_ACCOUNT_ID, ZOOM_OAUTH_CLIENT_ID, ZOOM_OAUTH_CLIENT_SECRET
     from settings — matching the existing .env.example keys.
     """
-    account_id = getattr(settings, 'ZOOM_OAUTH_ACCOUNT_ID', '') or getattr(settings, 'ZOOM_ACCOUNT_ID', '')
-    client_id = getattr(settings, 'ZOOM_OAUTH_CLIENT_ID', '') or getattr(settings, 'ZOOM_CLIENT_ID', '')
-    client_secret = getattr(settings, 'ZOOM_OAUTH_CLIENT_SECRET', '') or getattr(settings, 'ZOOM_CLIENT_SECRET', '')
+    account_id = getattr(settings, 'ZOOM_OAUTH_ACCOUNT_ID', '')
+    client_id = getattr(settings, 'ZOOM_OAUTH_CLIENT_ID', '')
+    client_secret = getattr(settings, 'ZOOM_OAUTH_CLIENT_SECRET', '')
 
     if not all([account_id, client_id, client_secret]):
         raise ValueError(
@@ -143,6 +143,9 @@ def create_recall_bot(join_url, bot_name='HelloDoc AI', join_at_iso=None):
     payload = {
         'meeting_url': join_url,
         'bot_name': bot_name,
+        'recording_config': {
+            'video_mixed_mp4': {},
+        },
     }
 
     if join_at_iso:
@@ -159,7 +162,7 @@ def create_recall_bot(join_url, bot_name='HelloDoc AI', join_at_iso=None):
     if response.status_code != 201:
         try:
             error_detail = response.json()
-        except:
+        except ValueError:
             error_detail = response.text
         logger.error(
             f"Recall.ai bot creation failed ({response.status_code}): {error_detail}. "
@@ -196,22 +199,39 @@ def get_recall_bot_recording_url(bot_id):
     response.raise_for_status()
     data = response.json()
 
-    recordings = data.get('recordings', [])
+    recordings = data.get('recordings') or []
     if not recordings:
         raise ValueError(f"No recordings found for Recall.ai bot {bot_id}")
 
-    # Walk through recordings to find a usable audio URL
+    # Walk through recordings to find a usable audio URL.
+    # Recall can return null for media_shortcuts or individual shortcuts.
+    inspected = []
     for recording in recordings:
-        media = recording.get('media_shortcuts', {})
+        media = recording.get('media_shortcuts') or {}
+        audio_mixed = media.get('audio_mixed') or {}
+        video_mixed = media.get('video_mixed') or {}
+        video = media.get('video') or {}
         audio_url = (
-            media.get('audio_mixed', {}).get('data', {}).get('download_url') or
-            media.get('video', {}).get('data', {}).get('download_url')
+            (audio_mixed.get('data') or {}).get('download_url') or
+            (video_mixed.get('data') or {}).get('download_url') or
+            (video.get('data') or {}).get('download_url')
         )
         if audio_url:
             logger.info(f"Recording URL found for bot {bot_id}")
             return audio_url
+        inspected.append({
+            'recording_id': recording.get('id'),
+            'recording_status': (recording.get('status') or {}).get('code'),
+            'media_shortcut_keys': sorted(media.keys()),
+            'audio_mixed_status': (audio_mixed.get('status') or {}).get('code'),
+            'video_mixed_status': (video_mixed.get('status') or {}).get('code'),
+            'video_status': (video.get('status') or {}).get('code'),
+        })
 
-    raise ValueError(f"No audio download URL found in recordings for bot {bot_id}")
+    raise ValueError(
+        f"No audio/video download URL found in recordings for bot {bot_id}. "
+        f"Inspected recordings: {inspected}"
+    )
 
 
 def download_audio_bytes(download_url):
@@ -236,29 +256,81 @@ def download_audio_bytes(download_url):
 # WEBHOOK SIGNATURE VERIFICATION
 # ─────────────────────────────────────────────────────────
 
-def verify_recall_signature(request_body_bytes, signature_header):
+def verify_recall_signature(request_body_bytes, headers):
     """
     Verifies the Recall.ai webhook HMAC-SHA256 signature.
     Protects the webhook endpoint from spoofed requests.
 
     Args:
         request_body_bytes: raw request.body bytes
-        signature_header: value of X-Recall-Signature header
+        headers: incoming request headers
 
     Returns True if valid, False otherwise.
     """
+    import binascii
     import hashlib
     import hmac
 
-    secret = getattr(settings, 'RECALL_AI_WEBHOOK_SECRET', '')
+    msg_id = headers.get('webhook-id') or headers.get('svix-id')
+    msg_timestamp = headers.get('webhook-timestamp') or headers.get('svix-timestamp')
+    msg_signature = headers.get('webhook-signature') or headers.get('svix-signature')
+
+    if headers.get('svix-signature') and getattr(settings, 'RECALL_SVIX_WEBHOOK_SECRET', ''):
+        secret = getattr(settings, 'RECALL_SVIX_WEBHOOK_SECRET', '')
+    else:
+        secret = getattr(settings, 'RECALL_AI_WEBHOOK_SECRET', '')
+
     if not secret:
-        logger.warning("RECALL_AI_WEBHOOK_SECRET not set — skipping signature verification")
-        return True  # Fail open during development; tighten in production
+        logger.warning("RECALL_AI_WEBHOOK_SECRET not set in Django settings")
+        return False
 
+    if not secret.startswith('whsec_'):
+        logger.warning("RECALL_AI_WEBHOOK_SECRET must start with 'whsec_'")
+        return False
+
+    if not msg_id or not msg_timestamp or not msg_signature:
+        logger.warning("Recall webhook signature headers are missing")
+        return False
+
+    try:
+        secret_part = secret[len('whsec_'):]
+        secret_part += '=' * (-len(secret_part) % 4)
+        signing_key = base64.b64decode(secret_part, validate=True)
+    except (binascii.Error, ValueError):
+        logger.warning("RECALL_AI_WEBHOOK_SECRET is not valid base64")
+        return False
+
+    try:
+        payload = request_body_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        logger.warning("Recall webhook payload is not valid UTF-8")
+        return False
+
+    signed_payload = f'{msg_id}.{msg_timestamp}.{payload}'.encode('utf-8')
     expected = hmac.new(
-        secret.encode(),
-        request_body_bytes,
-        hashlib.sha256,
-    ).hexdigest()
+        key=signing_key,
+        msg=signed_payload,
+        digestmod=hashlib.sha256,
+    ).digest()
 
-    return hmac.compare_digest(expected, signature_header)
+    for versioned_signature in msg_signature.split():
+        try:
+            version, signature = versioned_signature.split(',', 1)
+        except ValueError:
+            continue
+
+        if version != 'v1':
+            continue
+
+        try:
+            signature += '=' * (-len(signature) % 4)
+            received = base64.b64decode(signature, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+
+        if hmac.compare_digest(expected, received):
+            logger.info("Recall webhook signature verified successfully")
+            return True
+
+    logger.warning("Recall webhook signature mismatch")
+    return False

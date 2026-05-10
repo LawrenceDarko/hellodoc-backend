@@ -1,9 +1,10 @@
 import uuid
 from django.db import models
 from django.conf import settings
+from apps.core.models import SoftDeleteModel
 
 
-class Patient(models.Model):
+class Patient(SoftDeleteModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     doctor = models.ForeignKey(
         settings.AUTH_USER_MODEL,

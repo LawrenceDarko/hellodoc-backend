@@ -1,6 +1,6 @@
 import logging
 import json as json_module
-from rest_framework.decorators import api_view, permission_classes, parser_classes
+from rest_framework.decorators import api_view, permission_classes, parser_classes, throttle_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -11,6 +11,7 @@ from django.views.decorators.http import require_POST
 from django.http import HttpResponse
 
 from apps.patients.models import Patient
+from apps.core.throttles import OpenAIRateThrottle
 from .models import Consultation
 from .serializers import (
     ConsultationSerializer,
@@ -58,6 +59,7 @@ def consultation_list(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser, FormParser])
+@throttle_classes([OpenAIRateThrottle])
 def upload_consultation(request):
     """
     POST /api/consultations/upload/
@@ -94,6 +96,7 @@ def upload_consultation(request):
         source='upload',
         status='pending',
         progress_step='Upload received, queuing for processing...',
+        progress_percent=5,
         audio_file=audio_file,
         audio_file_name=audio_file.name,
         notes=notes,
@@ -111,6 +114,7 @@ def upload_consultation(request):
         'consultation_id': str(consultation.id),
         'status': consultation.status,
         'progress_step': consultation.progress_step,
+        'progress_percent': consultation.progress_percent,
         'message': 'File uploaded successfully. Processing has started.',
     }, status=status.HTTP_202_ACCEPTED)
 
@@ -126,7 +130,7 @@ def consultation_status(request, consultation_id):
     GET /api/consultations/:id/status/
 
     Lightweight endpoint for frontend polling.
-    Returns: { id, status, progress_step, error_message }
+    Returns: { id, status, progress_step, progress_percent, error_message }
 
     Status values the frontend should handle:
       'pending'      → show step 1 active (Uploading)
@@ -237,6 +241,7 @@ def schedule_consultation(request):
             source='zoom',
             status='scheduled',
             progress_step='Meeting created. AI bot will join automatically 2 minutes before start.',
+            progress_percent=0,
             scheduled_at=scheduled_at,
             duration_minutes=duration_minutes,
             notes=notes,
@@ -301,8 +306,7 @@ def recall_webhook(request):
     from .utils import verify_recall_signature
 
     # Verify Recall.ai signature
-    signature = request.headers.get('X-Recall-Signature', '')
-    if not verify_recall_signature(request.body, signature):
+    if not verify_recall_signature(request.body, request.headers):
         logger.warning("Recall webhook rejected: invalid signature")
         return HttpResponse(status=401)
 
@@ -330,21 +334,23 @@ def recall_webhook(request):
     if event == 'bot.in_call_recording':
         consultation.status = 'in_progress'
         consultation.progress_step = 'AI is in the Zoom call and recording...'
-        consultation.save(update_fields=['status', 'progress_step', 'updated_at'])
+        consultation.progress_percent = 5
+        consultation.save(update_fields=['status', 'progress_step', 'progress_percent'])
 
     elif event == 'bot.done':
         consultation.status = 'processing'
         consultation.progress_step = 'Call ended. Downloading recording...'
-        consultation.save(update_fields=['status', 'progress_step', 'updated_at'])
+        consultation.progress_percent = 8
+        consultation.save(update_fields=['status', 'progress_step', 'progress_percent'])
         # Hand off to Celery — downloads recording then runs existing pipeline
         process_zoom_consultation.delay(str(consultation.id), bot_id)
 
     elif event == 'bot.fatal_error':
-        error_msg = payload.get('data', {}).get('message', 'Recall.ai bot fatal error.')
+        error_msg = payload.get('data', {}).get('data', {}).get('code', 'Recall.ai bot fatal error.')
         consultation.status = 'failed'
         consultation.error_message = error_msg
         consultation.progress_step = 'AI bot failed to join the call.'
-        consultation.save(update_fields=['status', 'error_message', 'progress_step', 'updated_at'])
+        consultation.save(update_fields=['status', 'error_message', 'progress_step'])
         logger.error(f"Recall bot fatal error for consultation {consultation.id}: {error_msg}")
 
     # Always return 200 immediately — Recall.ai retries on non-200

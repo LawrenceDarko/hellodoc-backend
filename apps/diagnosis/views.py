@@ -1,4 +1,3 @@
-import json
 import logging
 from io import BytesIO
 from xml.sax.saxutils import escape

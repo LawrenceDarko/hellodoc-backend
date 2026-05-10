@@ -1,6 +1,24 @@
 from rest_framework import serializers
 from .models import Consultation
 
+ALLOWED_UPLOAD_CONTENT_TYPES = [
+    'audio/mpeg',
+    'audio/mp3',
+    'audio/wav',
+    'audio/x-wav',
+    'audio/wave',
+    'audio/webm',
+    'audio/ogg',
+    'audio/mp4',
+    'audio/m4a',
+    'audio/x-m4a',
+    'video/mp4',
+    'video/webm',
+    'video/ogg',
+]
+
+ALLOWED_UPLOAD_EXTENSIONS = ['.mp3', '.wav', '.m4a', '.mp4', '.webm']
+
 
 class ConsultationSerializer(serializers.ModelSerializer):
     patient_name = serializers.CharField(source='patient.name', read_only=True)
@@ -10,13 +28,13 @@ class ConsultationSerializer(serializers.ModelSerializer):
         model = Consultation
         fields = [
             'id', 'patient', 'patient_name', 'source', 'status',
-            'progress_step', 'zoom_meeting_id', 'zoom_join_url', 'zoom_link',
+            'progress_step', 'progress_percent', 'zoom_meeting_id', 'zoom_join_url', 'zoom_link',
             'zoom_start_url', 'zoom_password', 'recall_bot_id', 'scheduled_at',
             'audio_file_name', 'duration_minutes', 'notes',
             'error_message', 'created_at', 'updated_at'
         ]
         read_only_fields = [
-            'id', 'doctor', 'status', 'progress_step',
+            'id', 'doctor', 'status', 'progress_step', 'progress_percent',
             'audio_file_name', 'error_message', 'created_at', 'updated_at'
         ]
 
@@ -29,6 +47,7 @@ class ConsultationStatusSerializer(serializers.ModelSerializer):
             'id',
             'status',
             'progress_step',
+            'progress_percent',
             'error_message',
             'zoom_join_url',
             'zoom_password',
@@ -44,17 +63,19 @@ class ConsultationUploadSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def validate_audio_file(self, value):
-        allowed_types = ['audio/mpeg', 'audio/wav', 'audio/mp4', 'audio/x-m4a',
-                         'video/mp4', 'audio/webm', 'application/octet-stream']
-        allowed_extensions = ['.mp3', '.wav', '.m4a', '.mp4', '.webm']
         import os
         ext = os.path.splitext(value.name)[1].lower()
-        if ext not in allowed_extensions:
+        if ext not in ALLOWED_UPLOAD_EXTENSIONS:
             raise serializers.ValidationError(
-                f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}"
+                f"Unsupported file type. Allowed: {', '.join(ALLOWED_UPLOAD_EXTENSIONS)}"
             )
-        # OpenAI Whisper API limit is 25MB; files larger than this will be compressed
-        max_size = 500 * 1024 * 1024  # Accept up to 500MB; will compress if needed
+        content_type = getattr(value, 'content_type', '')
+        if content_type and content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
+            raise serializers.ValidationError(
+                f"Unsupported content type. Allowed: {', '.join(ALLOWED_UPLOAD_CONTENT_TYPES)}"
+            )
+
+        max_size = 100 * 1024 * 1024
         if value.size > max_size:
-            raise serializers.ValidationError("File size must be under 500MB.")
+            raise serializers.ValidationError("File size must be under 100MB.")
         return value

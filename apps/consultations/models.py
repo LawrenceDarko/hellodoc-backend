@@ -1,9 +1,10 @@
 import uuid
 from django.db import models
 from django.conf import settings
+from apps.core.models import SoftDeleteModel
 
 
-class Consultation(models.Model):
+class Consultation(SoftDeleteModel):
     """
     Created immediately when a doctor submits a file upload or schedules a Zoom call.
     The status field tracks the Celery processing pipeline.
@@ -35,6 +36,7 @@ class Consultation(models.Model):
     source = models.CharField(max_length=10, choices=SOURCE_CHOICES)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     progress_step = models.CharField(max_length=100, blank=True, default='')
+    progress_percent = models.PositiveSmallIntegerField(default=0)
     # For uploads
     audio_file = models.FileField(upload_to='consultations/audio/', null=True, blank=True)
     audio_file_name = models.CharField(max_length=255, blank=True)

@@ -38,6 +38,7 @@ PyJWT>=2.8,<3.0
 requests>=2.30,<3.0
 gunicorn>=22.0,<23.0
 whitenoise>=6.7,<7.0
+sentry-sdk[django,celery]>=2.19,<3.0
 
 # Dev & Testing
 ruff>=0.6,<1.0
