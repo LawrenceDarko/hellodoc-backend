@@ -23,6 +23,28 @@ def get_openai_client():
     return OpenAI(api_key=settings.OPENAI_API_KEY)
 
 
+def get_doctor_profile(consultation):
+    """
+    Fetches the DoctorProfile for the doctor who owns this consultation.
+    Returns a dict with style context for GPT-4 prompts.
+    Returns safe defaults if no profile exists.
+    """
+    try:
+        from apps.users.models import DoctorProfile
+        profile = DoctorProfile.objects.get(doctor=consultation.doctor)
+        return {
+            'specialty': profile.specialty or 'General Practice',
+            'template': profile.get_template_preference_display(),
+            'example_note': profile.example_note or '',
+        }
+    except Exception:
+        return {
+            'specialty': 'General Practice',
+            'template': 'SOAP Note',
+            'example_note': '',
+        }
+
+
 def update_status(consultation, status, step='', progress_percent=None):
     """Helper to update consultation status and save."""
     consultation.status = status
@@ -137,6 +159,29 @@ def process_consultation(self, consultation_id):
         # All done
         update_status(consultation, 'completed', 'Report ready', 100)
         logger.info(f"Consultation {consultation_id} fully processed.")
+        # Attempt to update patient clinical snapshot and care plan from generated report
+        try:
+            from apps.diagnosis.models import ConsultationReport
+            report = ConsultationReport.objects.filter(consultation=consultation).first()
+            if report:
+                # Build a simple snapshot from diagnosis items and SOAP plan
+                active_problems = [d.condition for d in report.diagnosis_items.all()]
+                care_plan = {
+                    'next_steps': report.soap_plan or '',
+                    'follow_up': '',
+                }
+                patient = consultation.patient
+                # assign structured snapshot fields (keep existing keys if present)
+                try:
+                    existing = patient.clinical_snapshot or {}
+                except Exception:
+                    existing = {}
+                existing.update({'active_problems': active_problems, 'medications': existing.get('medications', []), 'alerts': existing.get('alerts', [])})
+                patient.clinical_snapshot = existing
+                patient.care_plan = care_plan
+                patient.save(update_fields=['clinical_snapshot', 'care_plan', 'updated_at'])
+        except Exception:
+            logger.exception(f"Failed to update patient snapshot for consultation {consultation_id}")
 
     except Exception as exc:
         logger.error(f"Pipeline failed for {consultation_id}: {exc}", exc_info=True)
@@ -524,21 +569,34 @@ Return only the clinical note text, no other commentary.
     
     # Combine chunk notes into a single comprehensive doctor's note
     combined_chunks = "\n\n".join(chunk_notes)
+
+    profile = get_doctor_profile(consultation)
+
+    example_note_section = ''
+    if profile['example_note']:
+        example_note_section = f"""
+STYLE REFERENCE (example note written by this doctor — match their phrasing and level of detail):
+{profile['example_note']}
+"""
     
     synthesis_prompt = f"""
-You are a clinical documentation specialist. Below are clinical notes from different segments of a consultation.
-Synthesize these into a single, cohesive doctor's note in narrative form.
+You are a clinical documentation specialist assisting a {profile['specialty']} physician.
+
+Synthesize the clinical notes below into a single, cohesive doctor's note.
+Format it as a {profile['template']}.
 
 Ensure:
-- Chronological flow
-- No repetition
-- Professional medical language
-- All relevant findings and assessments are included
+- Use terminology and clinical conventions appropriate for {profile['specialty']}
+- Match the level of detail and documentation style of the example note if provided
+- Chronological flow with no repetition
+- Professional medical language throughout
+- All relevant findings, assessments, and plans included
+{example_note_section}
 
 CLINICAL SEGMENTS:
 {combined_chunks}
 
-Return only the final synthesized doctor's note.
+Return only the final synthesized doctor's note. No preamble or commentary.
 """
     
     update_status(consultation, 'analyzing', 'Synthesizing doctor\'s note...', 58)
@@ -574,9 +632,10 @@ def step_generate_soap(consultation, doctors_note):
     """
     update_status(consultation, 'analyzing', 'Generating SOAP note...', 70)
     client = get_openai_client()
+    profile = get_doctor_profile(consultation)
 
     prompt = f"""
-You are a clinical documentation AI assistant. Analyze the following doctor's note and extract a structured SOAP note.
+You are a clinical documentation AI assistant. Analyze the following doctor's note and extract a structured {profile['template']} note.
 
 Return ONLY a JSON object in exactly this format, no other text:
 {{
@@ -626,9 +685,10 @@ def step_generate_diagnosis(consultation, doctors_note):
     """
     update_status(consultation, 'analyzing', 'Generating differential diagnosis...', 82)
     client = get_openai_client()
+    profile = get_doctor_profile(consultation)
 
     prompt = f"""
-You are a clinical AI diagnostic assistant. Based on the following doctor's note, generate a differential diagnosis.
+You are a clinical AI diagnostic assistant specialising in {profile['specialty']}. Based on the following doctor's note, generate a differential diagnosis.
 
 Rules:
 - List between 3 and 6 possible conditions

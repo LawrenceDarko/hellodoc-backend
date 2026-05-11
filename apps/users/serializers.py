@@ -2,6 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 
 User = get_user_model()
+from .models import DoctorProfile
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -24,3 +25,18 @@ class RegisterSerializer(serializers.ModelSerializer):
             password=validated_data['password'],
             name=validated_data.get('name', '')
         )
+
+
+class DoctorProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DoctorProfile
+        fields = [
+            'specialty',
+            'template_preference',
+            'custom_template_name',
+            'example_note',
+            'onboarding_completed',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at']

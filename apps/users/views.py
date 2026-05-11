@@ -6,6 +6,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django.contrib.auth import get_user_model
 from .serializers import RegisterSerializer, UserSerializer
+from .models import DoctorProfile
+from .serializers import DoctorProfileSerializer
 
 User = get_user_model()
 
@@ -92,3 +94,44 @@ def logout(request):
     except Exception:
         pass
     return Response({'success': True}, status=status.HTTP_200_OK)
+
+
+@api_view(['GET', 'POST', 'PATCH'])
+@permission_classes([IsAuthenticated])
+def doctor_profile(request):
+    """
+    GET   /api/auth/profile/  — get the doctor's profile
+    POST  /api/auth/profile/  — create profile (first time)
+    PATCH /api/auth/profile/  — update existing profile
+    """
+    if request.method == 'GET':
+        try:
+            profile = DoctorProfile.objects.get(doctor=request.user)
+            return Response(DoctorProfileSerializer(profile).data)
+        except DoctorProfile.DoesNotExist:
+            return Response(
+                {'detail': 'Profile not found.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    if request.method == 'POST':
+        profile, created = DoctorProfile.objects.get_or_create(doctor=request.user)
+        serializer = DoctorProfileSerializer(profile, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+        return Response(
+            serializer.data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        )
+
+    if request.method == 'PATCH':
+        try:
+            profile = DoctorProfile.objects.get(doctor=request.user)
+        except DoctorProfile.DoesNotExist:
+            profile = DoctorProfile.objects.create(doctor=request.user)
+        serializer = DoctorProfileSerializer(profile, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+        return Response(serializer.data)

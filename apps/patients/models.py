@@ -16,6 +16,10 @@ class Patient(SoftDeleteModel):
     date_of_birth = models.DateField(null=True, blank=True)
     phone = models.CharField(max_length=20, null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
+    # Clinical snapshot stored as JSON: { active_problems: [], medications: [], alerts: [] }
+    clinical_snapshot = models.JSONField(null=True, blank=True, default=dict)
+    # Care plan stored as JSON: { next_steps: str, follow_up: str }
+    care_plan = models.JSONField(null=True, blank=True, default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
